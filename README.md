@@ -54,19 +54,32 @@ python main.py
 
 The example request is defined in `main.py`. It asks the agent to extract Pokémon data from PokeAPI and save a CSV under `data/extract/`. Edit that request to try a different extraction or transformation. The router and ETL agents use the `openai/gpt-oss-20b` model through Groq; model choices are configured in `utils/llm_pick.py`.
 
+For a direct extraction without the LLM router, use the CLI:
+
+```sh
+uv run python etl_cli.py \
+	--url https://pokeapi.co/api/v2/pokemon \
+	--output-folder data/extract \
+	--format csv
+```
+
+The CLI supports `csv`, `json`, and `parquet`. It does not require a Groq API key.
+
 The graph-image generation is optional. If the environment does not have IPython installed, the app may print `Could not generate graph image: No module named 'IPython'` and continue.
 
 ## ETL Output
 
-The extraction tool supports `csv`, `json`, and `parquet` output formats. It writes files relative to the project root with the name `extracted_data` and creates the output directory if needed. For example:
+The extractor follows API `next` links, validates that every page contains a list of JSON objects in `results`, and writes the combined records. It writes files relative to the project root with the name `extracted_data` and creates the output directory if needed. For example:
 
 ```text
 data/extract/extracted_data.csv
 ```
 
-The extractor reads the API response's `results` field. APIs that paginate results may return only one page; the current extractor does not follow a `next` link. PokeAPI's default endpoint returns 20 Pokémon per page, so the example CSV contains the first 20 unless pagination is added.
+Requests have a 30-second timeout and pagination is capped at 1,000 pages. Completed and failed extraction attempts are recorded in `logs/etl_runs.jsonl`; query parameters are omitted from the logged source URL.
 
-For transformations, the agent reads CSV, newline-delimited JSON, or Parquet input and asks a model to generate Pandas code. That generated code is executed by the application. Only use this feature with trusted requests and data, and do not run it in an environment containing secrets or valuable files.
+For transformations, the agent reads CSV, newline-delimited JSON, or Parquet input and asks a model for a JSON plan. The application applies only supported operations: filter, select columns, sort, drop duplicates, rename columns, and limit rows. Model-generated Python is not executed.
+
+Parquet requires the optional `pyarrow` engine. Add it to the project with `uv add pyarrow` before choosing `--format parquet`.
 
 ## PostgreSQL Workflows
 
@@ -78,9 +91,29 @@ To create and populate the sample tables, first configure the PostgreSQL values 
 uv run python feed_db.py
 ```
 
-`feed_db.py` creates the `public.users`, `vehicles`, `rides`, `payments`, and `ratings` tables and loads the corresponding CSV files from `data/`. **Warning:** it truncates these tables before loading, so running it again replaces their current contents. Use a disposable database or back up data first.
+`feed_db.py` creates the `public.users`, `vehicles`, `rides`, `payments`, and `ratings` tables and loads the corresponding CSV files from `data/`. It validates headers, required fields, primary-key uniqueness, and configured unique fields, then loads through temporary staging tables and upserts by primary key. Running it updates or inserts source rows without truncating existing tables; rows removed from a CSV are not deleted from PostgreSQL.
 
-The SQL agent needs valid PostgreSQL credentials and tables to answer database questions. Use an appropriately restricted database role; model-generated SQL should not be treated as a security boundary.
+The SQL agent needs valid PostgreSQL credentials and tables to answer database questions. Queries are restricted to a single `SELECT` or `WITH` statement, run in a read-only transaction with a 10-second statement timeout, and return at most 1,000 rows. Also use an appropriately restricted PostgreSQL role; application checks are not a substitute for least-privilege database permissions.
+
+## Ride-Share Reports
+
+After loading the sample tables, run the read-only reports:
+
+```sh
+uv run python -m utils.analytics
+```
+
+The reports show daily ride volume, cancellation rate, monthly completed-payment revenue, and top-rated drivers.
+
+## Tests
+
+Run the offline unit tests with:
+
+```sh
+uv run python -m unittest discover -s tests -v
+```
+
+The tests use mocked API and database interactions; they do not require live credentials or a running PostgreSQL server.
 
 ## Project Layout
 
@@ -88,9 +121,12 @@ The SQL agent needs valid PostgreSQL credentials and tables to answer database q
 agents/          Router, ETL, and SQL LangGraph agents
 Models/          Pydantic models and LangGraph state types
 utils/           Database, ETL, and Groq model helpers
+tests/           Offline tests for ETL, data quality, and SQL safeguards
 data/            Sample CSVs and ETL input/output folders
 main.py          Runs the built-in router and ETL example
+etl_cli.py       Configurable direct API extraction CLI
 feed_db.py       Creates and loads the sample PostgreSQL tables
+utils/analytics.py  Read-only ride-share analytics reports
 pyproject.toml   Project dependencies and Python requirement
 uv.lock          Locked dependency versions
 ```
@@ -101,4 +137,4 @@ uv.lock          Locked dependency versions
 - **Groq model not found:** check that the account can use the model configured in `utils/llm_pick.py`.
 - **PostgreSQL role does not exist:** set `user` to an existing PostgreSQL role and confirm `database`, `host`, `port`, and `password` match that server. PostgreSQL is not needed for the ETL example.
 - **IPython graph warning:** this only disables the optional graph image; it does not prevent the agent workflow from running.
-- **Only 20 API records:** the source endpoint is paginated and the current extractor processes only its first response page.
+- **Parquet output unavailable:** add the optional engine with `uv add pyarrow`.

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -78,30 +79,22 @@ def transform_load_tool(
     llm = pick_llm("low")
 
     prompt = f"""
-You are a Python Data Analyst who uses Pandas.
+You are a data analyst. Describe the requested transformation as a JSON array.
+Return JSON only, without markdown or explanations. Do not return Python code.
 
-Your task is to generate Pandas code that performs
-the ETL operation requested by the user.
+Allowed operations, applied in order:
+- {{"op":"filter","column":"status","operator":"eq","value":"completed"}}
+  Operators: eq, ne, gt, gte, lt, lte, contains, in, not_in, is_null, not_null.
+- {{"op":"select","columns":["ride_id","fare"]}}
+- {{"op":"sort","column":"fare","ascending":false}}
+- {{"op":"drop_duplicates","columns":["ride_id"]}}
+- {{"op":"rename","mapping":{{"fare":"total_fare"}}}}
+- {{"op":"limit","rows":100}}
 
-IMPORTANT RULES:
-
-1. Return ONLY executable Python/Pandas code.
-2. Do NOT provide explanations.
-3. Do NOT use markdown code fences.
-4. Do NOT write ```python.
-5. Create a Pandas DataFrame from the input file.
-6. Perform the transformation requested by the user.
-7. Save the transformed result to the requested output folder.
-8. Use the requested output format.
+Use only columns present in the input. Return [] if no transformation is needed.
 
 Input file:
 {input_file_path}
-
-Output folder:
-{output_folder}
-
-Output format:
-{output_format}
 
 User question:
 {user_question}
@@ -111,48 +104,18 @@ Sample data:
 """
 
     response = llm.invoke(prompt)
+    try:
+        operations = json.loads(response.content)
+    except json.JSONDecodeError as error:
+        raise ValueError("The model returned an invalid transformation plan.") from error
 
-    pandas_code = response.content.strip()
-
-
-    if pandas_code.startswith("```python"):
-        pandas_code = pandas_code[
-            len("```python"):
-        ]
-
-    if pandas_code.startswith("```"):
-        pandas_code = pandas_code[
-            len("```"):
-        ]
-
-    if pandas_code.endswith("```"):
-        pandas_code = pandas_code[
-            :-len("```")
-        ]
-
-    pandas_code = pandas_code.strip()
-
-    results = etl_tools.execute_code(
-        pandas_code
+    result = etl_tools.transform_load(
+        input_file_path,
+        output_folder,
+        output_format,
+        operations,
     )
-
-    return f"""
-The data was transformed and saved.
-
-Output folder:
-{output_folder}
-
-Output format:
-{output_format}
-
-Pandas code executed:
-
-{pandas_code}
-
-Execution result:
-
-{results}
-"""
+    return f"{result}\nApplied operations: {json.dumps(operations)}"
 
 
 tools = [

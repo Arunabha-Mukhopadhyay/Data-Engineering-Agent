@@ -1,8 +1,11 @@
 import os
-import csv
+from pathlib import Path
+
 import psycopg2
 from psycopg2 import sql
 from dotenv import load_dotenv
+from utils.data_quality import validate_csv
+
 load_dotenv()
 
 if 'port' not in os.environ:
@@ -16,7 +19,20 @@ DB_CONFIG = {
     "password": os.environ['password'],
 }
 
-CSV_DIR = "data"
+CSV_DIR = Path(__file__).resolve().parent / "data"
+
+REQUIRED_COLUMNS = {
+    "users": {"user_id", "first_name", "last_name", "email", "user_type"},
+    "vehicles": {"vehicle_id", "driver_id"},
+    "rides": {"ride_id", "rider_id", "driver_id"},
+    "payments": {"payment_id", "ride_id", "user_id"},
+    "ratings": {"rating_id", "ride_id", "rider_id", "driver_id"},
+}
+UNIQUE_COLUMNS = {
+    "users": ("email",),
+    "vehicles": ("license_plate",),
+    "payments": ("transaction_id",),
+}
 
 
 conn = psycopg2.connect(**DB_CONFIG)
@@ -205,37 +221,34 @@ print("Tables created successfully")
 
 
 # ============================================================
-# OPTIONAL: CLEAR EXISTING DATA
-# ============================================================
-
-# Uncomment this section if you want every execution
-# to completely reload the CSV data.
-
-
-cursor.execute("""
-    TRUNCATE TABLE
-        public.ratings,
-        public.payments,
-        public.rides,
-        public.vehicles,
-        public.users
-    CASCADE;
-""")
-
-
-
-# ============================================================
 # LOAD CSV USING POSTGRES COPY
 # ============================================================
 
 def load_csv(table_name, csv_file, columns):
+    file_path = CSV_DIR / csv_file
 
-    file_path = os.path.join(CSV_DIR, csv_file)
-
-    if not os.path.exists(file_path):
+    if not file_path.exists():
         raise FileNotFoundError(
             f"CSV file not found: {file_path}"
         )
+
+    row_count = validate_csv(
+        file_path,
+        columns,
+        primary_key=columns[0],
+        required_columns=REQUIRED_COLUMNS[table_name],
+        unique_columns=UNIQUE_COLUMNS.get(table_name, ()),
+    )
+    staging_table = f"staging_{table_name}"
+    cursor.execute(
+        sql.SQL(
+            "CREATE TEMP TABLE {} (LIKE public.{} INCLUDING DEFAULTS) "
+            "ON COMMIT DROP"
+        ).format(
+            sql.Identifier(staging_table),
+            sql.Identifier(table_name),
+        )
+    )
 
     copy_sql = sql.SQL("""
         COPY {} ({})
@@ -247,7 +260,7 @@ def load_csv(table_name, csv_file, columns):
             NULL ''
         )
     """).format(
-        sql.Identifier("public", table_name),
+        sql.Identifier(staging_table),
         sql.SQL(", ").join(
             sql.Identifier(column)
             for column in columns
@@ -257,7 +270,7 @@ def load_csv(table_name, csv_file, columns):
     with open(
         file_path,
         "r",
-        encoding="utf-8"
+        encoding="utf-8-sig"
     ) as file:
 
         cursor.copy_expert(
@@ -265,7 +278,33 @@ def load_csv(table_name, csv_file, columns):
             file
         )
 
-    print(f"Loaded {csv_file}")
+    column_list = sql.SQL(", ").join(
+        sql.Identifier(column) for column in columns
+    )
+    primary_key = columns[0]
+    updates = sql.SQL(", ").join(
+        sql.SQL("{} = EXCLUDED.{}").format(
+            sql.Identifier(column),
+            sql.Identifier(column),
+        )
+        for column in columns
+        if column != primary_key
+    )
+    cursor.execute(
+        sql.SQL(
+            "INSERT INTO {} ({}) SELECT {} FROM {} "
+            "ON CONFLICT ({}) DO UPDATE SET {}"
+        ).format(
+            sql.Identifier("public", table_name),
+            column_list,
+            column_list,
+            sql.Identifier(staging_table),
+            sql.Identifier(primary_key),
+            updates,
+        )
+    )
+
+    print(f"Validated and upserted {row_count} rows from {csv_file}")
 
 
 # ============================================================
